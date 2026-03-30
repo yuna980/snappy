@@ -1,26 +1,18 @@
 "use client";
 
 import { useEffect, useState, useRef } from "react";
+import { generateMonthlyReport, getAIDailyMission } from "./actions/report";
+import { supabase } from "../lib/supabase";
 
 const MOCK_USER = { uid: "user_1", hasSeenTooltip: false, lastSnapDate: null };
 
-// 데일리 미션 풀 - 날짜기준 자동 선택 (index = dateNum % pool.length)
-const MISSION_POOL = [
-  { prefix: "오늘 내 시야에 들어온", keyword: "가장 선명한 빨간색" },
-  { prefix: "스쳐 지나쳐도 궁금하지 않았던", keyword: "벽의 표면" },
-  { prefix: "엄청 많지만 유심한 적 없던", keyword: "오늘 하늘의 구름" },
-  { prefix: "누군가가 남기고 간", keyword: "귀여운 흔적" },
-  { prefix: "지금 이 순간의", keyword: "빛과 그림자" },
-  { prefix: "남들이 모르는", keyword: "미세한 패턴" },
-  { prefix: "오늘 일상에서 발견한", keyword: "예상치 못한 색" },
-];
+interface Mission {
+  id: string;
+  date: string;
+  prefix: string;
+  keyword: string;
+}
 
-const getTodayMission = () => {
-  const today = new Date();
-  const dateNum = today.getFullYear() * 10000 + (today.getMonth() + 1) * 100 + today.getDate();
-  const idx = dateNum % MISSION_POOL.length;
-  return { id: `mission_${dateNum}`, date: today.toISOString().split('T')[0], ...MISSION_POOL[idx] };
-};
 
 interface MonthlySummary {
   id: string;
@@ -29,36 +21,21 @@ interface MonthlySummary {
   tags: string[]; // spec says 'desc' string but tags array is more flexible for UI, joining with dot later
   fullText: string;
   isClaimed: boolean;
-  theme: 'orange' | 'blue' | 'purple';
+  theme: 'orange' | 'blue' | 'purple' | 'green';
 }
 
 export default function App() {
   const [mounted, setMounted] = useState(false);
   const [user, setUser] = useState<{uid:string, hasSeenTooltip:boolean, lastSnapDate:string|null}>(MOCK_USER);
-  const mission = getTodayMission();
+  const [mission, setMission] = useState<Mission | null>(null);
   const [snaps, setSnaps] = useState<any[]>([]);
+  const [isLoadingMission, setIsLoadingMission] = useState(true);
+
   
   // 리포트 데이터 (명세서 기반 데이터 구조)
-  const [monthlyReports, setMonthlyReports] = useState<MonthlySummary[]>([
-    {
-      id: "report_2026_03",
-      month: "2026. 03",
-      title: "차분한 봄의 관찰자",
-      tags: ["봄 활동 70%", "무채색 선호"],
-      fullText: "당신은 이번 달 유독 차분한 무채색의 풍경에 시선을 멈추었네요. 일상 속에 숨어있는 고요한 질감을 찾아내는 능력이 탁월합니다.",
-      isClaimed: false,
-      theme: 'orange'
-    },
-    {
-       id: "report_2026_02",
-       month: "2026. 02",
-       title: "활기찬 아침의 탐험가",
-       tags: ["아침 활동 80%", "난색 선호"],
-       fullText: "활기 넘치는 아침의 에너지를 붉은 계열의 색상으로 기록해 주셨습니다. 따뜻한 시선으로 일상의 온도를 높이는 탐험가시군요.",
-       isClaimed: true,
-       theme: 'blue'
-    }
-  ]);
+  const [monthlyReports, setMonthlyReports] = useState<MonthlySummary[]>([]);
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [isUploading, setIsUploading] = useState(false);
 
   const getThemeColor = (theme: string) => {
       switch (theme) {
@@ -103,25 +80,71 @@ export default function App() {
 
   useEffect(() => {
     const lUser = localStorage.getItem("user");
-    const lSnaps = localStorage.getItem("snaps");
-    const lReports = localStorage.getItem("monthlyReports");
     if (lUser) setUser(JSON.parse(lUser));
-    if (lSnaps) setSnaps(JSON.parse(lSnaps));
-    if (lReports) setMonthlyReports(JSON.parse(lReports));
     setMounted(true);
+
+    const initData = async () => {
+      const today = new Date();
+      const dateStr = today.toISOString().split('T')[0];
+      const missionId = `mission_${dateStr.replace(/-/g, '')}`;
+      const activeUserUid = lUser ? JSON.parse(lUser).uid : MOCK_USER.uid;
+      
+      try {
+        // 1. Fetch or Create Global Daily Mission
+        let { data: dbMission } = await supabase.from('daily_missions').select('*').eq('id', missionId).single();
+        if (!dbMission) {
+           const aiMission = await getAIDailyMission(dateStr);
+           const { data: newMission } = await supabase.from('daily_missions').insert({
+             id: missionId,
+             date: dateStr,
+             prefix: aiMission.prefix,
+             keyword: aiMission.keyword
+           }).select().single();
+           dbMission = newMission || { id: missionId, date: dateStr, prefix: aiMission.prefix, keyword: aiMission.keyword };
+        }
+        setMission({ id: dbMission.id, date: dbMission.date, prefix: dbMission.prefix, keyword: dbMission.keyword });
+
+        // 2. Fetch User Snaps
+        const { data: dbSnaps } = await supabase.from('snaps').select('*, daily_missions(keyword)').eq('user_id', activeUserUid).order('created_at', { ascending: false });
+        if (dbSnaps) {
+            setSnaps(dbSnaps.map(s => ({
+               id: s.id,
+               uid: s.user_id,
+               missionId: s.mission_id,
+               keyword: s.daily_missions?.keyword || "진행된 미션",
+               imageUrl: s.image_url,
+               createdAt: s.created_at,
+               dayCount: 0 // Will map properly in UI
+            })));
+        }
+
+        // 3. Fetch AI Reports
+        const { data: dbReports } = await supabase.from('monthly_reports').select('*').eq('user_id', activeUserUid).order('created_at', { ascending: false });
+        if (dbReports) {
+            setMonthlyReports(dbReports.map(r => ({
+               id: r.id,
+               month: r.month,
+               title: r.title,
+               tags: r.tags,
+               fullText: r.full_text,
+               theme: r.theme,
+               isClaimed: r.is_claimed
+            })));
+        }
+      } catch (err) {
+        console.error("Init Data Error:", err);
+      } finally {
+        setIsLoadingMission(false);
+      }
+    };
+    initData();
   }, []);
 
   useEffect(() => {
     if (mounted) {
       localStorage.setItem("user", JSON.stringify(user));
-      try {
-        localStorage.setItem("snaps", JSON.stringify(snaps));
-      } catch (error) {
-        console.error("Storage saving error:", error);
-      }
-      localStorage.setItem("monthlyReports", JSON.stringify(monthlyReports));
     }
-  }, [user, snaps, monthlyReports, mounted]);
+  }, [user, mounted]);
 
   const navigate = (tab: string) => {
     if (tab !== 'home' && tempImageUrl) {
@@ -160,27 +183,122 @@ export default function App() {
   };
 
   const todayStr = new Date().toISOString().split('T')[0];
-  const todaySnap = snaps.find(s => s.missionId === mission.id && s.uid === user.uid && s.createdAt.startsWith(todayStr));
+  const todaySnap = snaps.find(s => s.missionId === mission?.id && s.uid === user.uid && s.createdAt.startsWith(todayStr));
   const hasSnappedToday = user.lastSnapDate === todayStr && !!todaySnap;
 
-  const confirmSnap = () => {
-    if (hasSnappedToday && todaySnap) {
-       const updatedSnaps = snaps.map(s => s.id === todaySnap.id ? { ...s, imageUrl: tempImageUrl } : s);
-       setSnaps(updatedSnaps);
-    } else {
-       const newSnap = {
-           id: "s_" + Date.now(), uid: user.uid, missionId: mission.id, imageUrl: tempImageUrl,
-           createdAt: new Date().toISOString(), dayCount: snaps.length + 1
-       };
-       setSnaps([newSnap, ...snaps]);
-       setUser({ ...user, lastSnapDate: todayStr });
+  const confirmSnap = async () => {
+    if (!tempImageUrl) return;
+    setIsUploading(true);
+    let finalUrl = tempImageUrl;
+
+    try {
+        const base64Response = await fetch(tempImageUrl);
+        const blob = await base64Response.blob();
+        const fileName = `${user.uid}_${todayStr}.webp`;
+        // Upload to Supabase Storage
+        const { error: uploadError } = await supabase.storage.from('snaps').upload(fileName, blob, { contentType: 'image/webp', upsert: true });
+        
+        if (uploadError) {
+           console.error("Upload error:", uploadError);
+           throw uploadError;
+        }
+        
+        const { data: publicData } = supabase.storage.from('snaps').getPublicUrl(fileName);
+        finalUrl = publicData.publicUrl;
+
+        if (hasSnappedToday && todaySnap) {
+           // Update existing snap in DB
+           await supabase.from('snaps').update({ image_url: finalUrl }).eq('id', todaySnap.id);
+           const updatedSnaps = snaps.map(s => s.id === todaySnap.id ? { ...s, imageUrl: finalUrl } : s);
+           setSnaps(updatedSnaps);
+        } else {
+           // Insert new snap into DB
+           const { data: newDbSnap, error: dbError } = await supabase.from('snaps').insert({
+               user_id: user.uid,
+               mission_id: mission?.id,
+               image_url: finalUrl
+           }).select().single();
+           
+           if (dbError) throw dbError;
+
+           if (newDbSnap) {
+               const newSnap = {
+                   id: newDbSnap.id, 
+                   uid: newDbSnap.user_id, 
+                   missionId: newDbSnap.mission_id, 
+                   keyword: mission?.keyword || "미션 없음",
+                   imageUrl: finalUrl,
+                   createdAt: newDbSnap.created_at, 
+                   dayCount: snaps.length + 1
+               };
+               setSnaps([newSnap, ...snaps]);
+               setUser({ ...user, lastSnapDate: todayStr });
+           }
+        }
+    } catch(err) {
+        console.error(err);
+        alert("사진 저장에 실패했습니다.");
+    } finally {
+        setIsUploading(false);
+        setTempImageUrl(null);
     }
-    setTempImageUrl(null);
   };
 
-  const confirmSnapAndGo = (tab: string) => {
-    confirmSnap();
+  const confirmSnapAndGo = async (tab: string) => {
+    await confirmSnap();
     setCurrentTab(tab);
+  };
+
+  // AI 리포트 생성 함수
+  const triggerReportGeneration = async () => {
+    if (snaps.length < 3) {
+      alert("최소 3개 이상의 스냅이 필요해요! 조금 더 일상을 기록해볼까요?");
+      return;
+    }
+    
+    setIsGenerating(true);
+    try {
+      const lastMonth = new Date();
+      lastMonth.setMonth(lastMonth.getMonth()); // 현재 월 기준 (테스트용)
+      const monthStr = `${lastMonth.getFullYear()}. 0${lastMonth.getMonth() + 1}`.slice(-7).replace('. 0', '. ');
+      
+      const snapsData = snaps.map(s => {
+        // 기존 missionPool 방식과의 호환을 위한 더미 처리나 매칭 필요 없음 
+        // keyword 정보를 아예 snap 객체에 저장하도록 유도하는게 좋음
+        return { keyword: s.keyword || "알 수 없는 관찰", date: s.createdAt.split('T')[0] };
+      });
+
+      const report = await generateMonthlyReport(monthStr, snapsData);
+      
+      const { data: savedReport, error } = await supabase.from('monthly_reports').insert({
+          user_id: user.uid,
+          month: monthStr,
+          title: report.title,
+          tags: report.tags,
+          full_text: report.fullText,
+          theme: report.theme,
+          is_claimed: false
+      }).select().single();
+
+      if (error) throw error;
+      
+      const newReport: MonthlySummary = {
+        id: savedReport.id,
+        month: savedReport.month,
+        title: savedReport.title,
+        tags: savedReport.tags,
+        fullText: savedReport.full_text,
+        isClaimed: savedReport.is_claimed,
+        theme: savedReport.theme as 'orange' | 'blue' | 'purple' | 'green'
+      };
+
+      setMonthlyReports([newReport, ...monthlyReports]);
+    } catch (error) {
+      console.error(error);
+      alert("리포트 생성 중 오류가 발생했어요.");
+    } finally {
+      setIsGenerating(false);
+    }
   };
 
   const renderHeader = () => {
@@ -209,50 +327,62 @@ export default function App() {
             <input type="file" ref={fileInputRef} style={{display:'none'}} accept="image/*" onChange={handleImageUpload} />
             <input type="file" ref={cameraInputRef} style={{display:'none'}} accept="image/*" capture="environment" onChange={handleImageUpload} />
 
-            <div className="badge-wrapper">
-              <span className="day-badge">DAY {String(snaps.length + (hasSnappedToday ? 0 : 1)).padStart(2, '0')}</span>
-              <span className="date-badge">{todayStr.replace(/-/g, '.')}</span>
-            </div>
-
-            <div className="mission-text">
-              {mission.prefix}<br/>
-              <span style={{color:'var(--text-main)'}}>{mission.keyword.split(' ').slice(0, -1).join(' ')} </span>
-              <span style={{color:'var(--primary)'}}>{mission.keyword.split(' ').slice(-1)[0]}</span>
-            </div>
-
-            {(!hasSnappedToday && !tempImageUrl) ? (
-              <div className="dashed-box">
-                <button className="snap-btn" onClick={() => setActiveModal('uploadOptions')}>
-                    <i className="ri-camera-fill"></i>
-                </button>
-                <div className="snap-title">스내피 찍기</div>
-                <div className="snap-desc">화면을 탭하여 순간을 남기세요</div>
-              </div>
-            ) : (
-              <>
-                <div className="uploaded-photo-card fade-in">
-                    <img src={tempImageUrl || todaySnap?.imageUrl} className="uploaded-photo-img" alt="snap" />
-                    <div className="uploaded-photo-overlay">
-                        <div className="overlay-sub">SNAPPY SHOT</div>
-                        <div className="overlay-title">{mission.keyword}</div>
+            {isLoadingMission ? (
+                <div style={{ flex: 1, display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', paddingBottom: '100px' }}>
+                    <div style={{ width: '80px', height: '80px', borderRadius: '50%', background: 'var(--primary-light)', display: 'flex', alignItems: 'center', justifyContent: 'center', marginBottom: '1.5rem', animation: 'pulse 1.5s ease-in-out infinite' }}>
+                        <i className="ri-quill-pen-line" style={{ fontSize: '2rem', color: 'var(--primary)' }}></i>
                     </div>
+                    <p style={{ color: 'var(--text-main)', fontWeight: 800, fontSize: '1.1rem', marginBottom: '0.5rem' }}>오늘의 미션을 적는 중...</p>
+                    <p style={{ color: 'var(--text-light)', fontSize: '0.85rem', fontWeight: 600 }}>Gemini가 당신의 하루를 관찰하고 있어요</p>
                 </div>
-                <div style={{ display: 'flex', gap: '0.75rem', marginTop: '-1rem', marginBottom: '1.5rem' }}>
-                    <button
-                        onClick={() => setActiveModal('uploadOptions')}
-                        style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.5rem', padding: '1rem', borderRadius: '1.25rem', background: '#f5f5f4', color: '#57534e', fontWeight: 800, fontSize: '0.9rem' }}
-                    >
-                        <i className="ri-loop-left-line" style={{ fontSize: '1.1rem' }}></i> 다시 찍기
-                    </button>
-                    {!hasSnappedToday && (
+            ) : mission && (
+              <>
+                <div className="badge-wrapper">
+                  <span className="day-badge">DAY {String(snaps.length + (hasSnappedToday ? 0 : 1)).padStart(2, '0')}</span>
+                  <span className="date-badge">{todayStr.replace(/-/g, '.')}</span>
+                </div>
+
+                <div className="mission-text">
+                  <span style={{ color: 'var(--text-light)', display: 'block', fontSize: '1rem', fontWeight: 700, marginBottom: '0.25rem' }}>{mission?.prefix}</span>
+                  <span style={{color:'var(--text-main)'}}>{mission?.keyword.split(' ').slice(0, -1).join(' ')} </span>
+                  <span style={{color:'var(--primary)'}}>{mission?.keyword.split(' ').slice(-1)[0]}</span>
+                </div>
+
+                {(!hasSnappedToday && !tempImageUrl) ? (
+                  <div className="dashed-box" onClick={() => setActiveModal('uploadOptions')}>
+                    <div className="snap-btn">
+                        <i className="ri-camera-fill"></i>
+                    </div>
+                    <div className="snap-title">스내피 찍기</div>
+                    <div className="snap-desc">화면을 탭하여 순간을 남기세요</div>
+                  </div>
+                ) : (
+                  <>
+                    <div className="uploaded-photo-card fade-in" onClick={() => { if(hasSnappedToday) { setModalData(todaySnap); setActiveModal('snap'); } }}>
+                        <img src={tempImageUrl || todaySnap?.imageUrl} className="uploaded-photo-img" alt="snap" />
+                        <div className="uploaded-photo-overlay">
+                            <div className="overlay-sub">SNAPPY SHOT</div>
+                            <div className="overlay-title">{mission?.keyword}</div>
+                        </div>
+                    </div>
+                    <div style={{ display: 'flex', gap: '0.75rem', marginTop: '-1rem', marginBottom: '1.5rem' }}>
                         <button
-                            onClick={confirmSnap}
-                            style={{ flex: 1.5, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.5rem', padding: '1rem', borderRadius: '1.25rem', background: 'var(--primary)', color: 'white', fontWeight: 800, fontSize: '1rem', boxShadow: '0 8px 15px rgba(249, 115, 22, 0.2)' }}
+                            onClick={() => setActiveModal('uploadOptions')}
+                            style={{ flex: 1, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.5rem', padding: '1rem', borderRadius: '1.25rem', background: '#f5f5f4', color: '#57534e', fontWeight: 800, fontSize: '0.9rem' }}
                         >
-                            <i className="ri-check-line" style={{ fontSize: '1.2rem' }}></i> 기록 완료
+                            <i className="ri-loop-left-line" style={{ fontSize: '1.1rem' }}></i> 다시 찍기
                         </button>
-                    )}
-                </div>
+                        {!hasSnappedToday && (
+                            <button
+                                onClick={confirmSnap}
+                                style={{ flex: 1.5, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '0.5rem', padding: '1rem', borderRadius: '1.25rem', background: 'var(--primary)', color: 'white', fontWeight: 800, fontSize: '1rem', boxShadow: '0 8px 15px rgba(249, 115, 22, 0.2)' }}
+                            >
+                                <i className="ri-check-line" style={{ fontSize: '1.2rem' }}></i> 기록 완료
+                            </button>
+                        )}
+                    </div>
+                  </>
+                )}
               </>
             )}
           </>
@@ -273,39 +403,57 @@ export default function App() {
             {/* 리포트 섹션: 스냅이 있을 때만 노출 */}
             {snaps.length > 0 ? (
               <>
-                {monthlyReports.length > 0 && (
-                  <div style={{ marginBottom: '2.5rem' }}>
+                <div style={{ marginBottom: '2.5rem' }}>
                     
-                    {/* 1. 대기 중인 리포트 배너 (Glassmorphism + Aurora Ambient) */}
-                    {monthlyReports.find(r => !r.isClaimed) && (
+                    {/* 대기 중인 리포트 배너 혹은 생성 버튼 */}
+                    {monthlyReports.some(r => !r.isClaimed) ? (
+                      monthlyReports.filter(r => !r.isClaimed).map(pendingReport => (
+                        <div 
+                          key={pendingReport.id}
+                          className="pending-glass-card"
+                          onClick={() => { setModalData(pendingReport); setActiveModal('report'); }}
+                        >
+                            <div className="aurora-orb orb-top-right"></div>
+                            <div className="aurora-orb orb-bottom-left"></div>
+
+                            <div className="squircle-icon-box">
+                                <i className="ri-sparkling-fill" style={{ color: 'white', fontSize: '1.5rem' }}></i>
+                            </div>
+
+                            <div style={{ flex: 1, zIndex: 2, position: 'relative' }}>
+                                <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', marginBottom: '0.2rem' }}>
+                                    <span className="pending-banner-sub">MONTHLY AI</span>
+                                    <span className="pending-new-badge">NEW</span>
+                                </div>
+                                <h2 className="pending-banner-title">
+                                    {pendingReport.month}의 시선 요약이<br/>도착했어요 💌
+                                </h2>
+                            </div>
+
+                            <div className="pending-chevron-box" style={{ zIndex: 2 }}>
+                                <i className="ri-arrow-right-s-line" style={{ color: '#D4D4D8', fontSize: '1.5rem' }}></i>
+                            </div>
+                        </div>
+                      ))
+                    ) : (
+                      // 아직 리포트가 없을 때 생성 유도 배너
                       <div 
-                        className="pending-glass-card"
-                        onClick={() => { setModalData(monthlyReports.find(r => !r.isClaimed)); setActiveModal('report'); }}
+                        className="pending-glass-card" 
+                        onClick={triggerReportGeneration}
+                        style={{ background: 'rgba(255, 255, 255, 0.4)' }}
                       >
-                          <div className="aurora-orb orb-top-right"></div>
-                          <div className="aurora-orb orb-bottom-left"></div>
-
-                          <div className="squircle-icon-box">
-                              <i className="ri-sparkling-fill" style={{ color: 'white', fontSize: '1.5rem' }}></i>
-                          </div>
-
-                          <div style={{ flex: 1, zIndex: 2, position: 'relative' }}>
-                              <div style={{ display: 'flex', alignItems: 'center', gap: '0.4rem', marginBottom: '0.2rem' }}>
-                                  <span className="pending-banner-sub">MONTHLY AI</span>
-                                  <span className="pending-new-badge">NEW</span>
-                              </div>
-                              <h2 className="pending-banner-title">
-                                  3월의 시선 요약이<br/>도착했어요 💌
-                              </h2>
-                          </div>
-
-                          <div className="pending-chevron-box" style={{ zIndex: 2 }}>
-                              <i className="ri-arrow-right-s-line" style={{ color: '#D4D4D8', fontSize: '1.5rem' }}></i>
-                          </div>
+                         <div className="squircle-icon-box" style={{ background: '#1c1917' }}>
+                            <i className="ri-magic-line" style={{ color: 'white', fontSize: '1.5rem' }}></i>
+                         </div>
+                         <div style={{ flex: 1 }}>
+                            <div className="pending-banner-sub" style={{ color: '#78716c' }}>READY TO ANALYZE</div>
+                            <h2 className="pending-banner-title">기록된 시선들을 분석하여<br/>나만의 리포트를 만들어보세요</h2>
+                         </div>
+                         {isGenerating && <div style={{ position: 'absolute', inset: 0, background: 'rgba(255,255,255,0.8)', zIndex: 10, display: 'flex', alignItems: 'center', justifyContent: 'center', fontWeight: 900, color: 'var(--primary)', borderRadius: '1.5rem' }}>분석 중...</div>}
                       </div>
                     )}
 
-                    {/* 2. 소장된 리포트 캐러셀 (Exhibition Ticket Concept) */}
+                    {/* 소장된 리포트 캐러셀 (Exhibition Ticket Concept) */}
                     {monthlyReports.filter(r => r.isClaimed).length > 0 && (
                       <div className="carousel-wrapper">
                         <div 
@@ -343,8 +491,7 @@ export default function App() {
                         </div>
                       </div>
                     )}
-                  </div>
-                )}
+                </div>
 
                 {/* 그리드 갤러리 */}
                 <div className="grid-gallery">
@@ -485,7 +632,7 @@ export default function App() {
                            {new Date(modalData.createdAt).toISOString().split('T')[0].replace(/-/g, '.')}
                         </span>
                     </div>
-                    <div style={{fontWeight:800, fontSize:'1.25rem', color:'#1c1917'}}>{mission.keyword}</div>
+                    <div style={{fontWeight:800, fontSize:'1.25rem', color:'#1c1917'}}>{modalData.keyword || "알 수 없는 관찰"}</div>
                 </div>
             </div>
           )}
